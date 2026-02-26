@@ -11,14 +11,33 @@ R_UNIVERSAL = 8.314462618
 M_AIR = 0.0289652
 PSIA_TO_PA = 6894.757293168
 
-# Критические параметры компонентов (минимальный набор для текущего состава).
-# Значения заданы в SI.
-# Источник по методике использования в смеси: Инструкция (1980), гл. II.3,
-# формулы (II.12)-(II.13): псевдокритические параметры как сумма xi*Pкр,i и xi*Tкр,i.
+# Критические параметры компонентов (Tc [K], Pc [Pa]).
+# Набор расширен, чтобы можно было задавать более детальный состав газа.
 COMPONENT_CRITICAL_PROPS: Dict[str, Tuple[float, float]] = {
     "CH4": (190.56, 4.5992e6),
     "C2H6": (305.32, 4.8720e6),
+    "C3H8": (369.83, 4.2480e6),
+    "IC4H10": (407.85, 3.6480e6),
+    "NC4H10": (425.12, 3.7960e6),
+    "IC5H12": (460.35, 3.3700e6),
+    "NC5H12": (469.70, 3.3700e6),
+    "NC6H14": (507.60, 3.0250e6),
+    "N2": (126.20, 3.3958e6),
+    "CO2": (304.20, 7.3773e6),
+    "H2S": (373.20, 8.9600e6),
+    "HE": (5.20, 0.2270e6),
+    "AR": (150.86, 4.8630e6),
 }
+
+# Допустимые названия методик задаются явно и без алиасов:
+# ppc_method:
+# - composition_linear
+# - composition_precise
+# - specific_gravity_sutton
+# z_method:
+# - dranchuk_abou_kassem
+# - aliev_zotov_two_parameter
+# - papay
 
 
 def mpa_to_pa(value_mpa: float) -> float:
@@ -36,36 +55,41 @@ def md_to_m2(value_md: float) -> float:
     return value_md * MD_TO_M2
 
 
-def _build_composition(methane_mol_frac: float | None, ethane_mol_frac: float | None) -> Dict[str, float] | None:
+def _build_composition(
+    composition_mol_frac: Dict[str, float] | None = None,
+) -> Dict[str, float] | None:
     """
-    Собирает молярный состав из доступных полей конфигурации.
+    Собирает молярный состав из доступных входов и нормирует его.
 
-    Роль в проекте:
-    - Позволяет использовать составной расчет псевдокритических параметров,
-      если заданы доли CH4/C2H6.
+    Логика:
+    - если передан расширенный словарь состава, используем его;
+    - иначе возвращаем None (дальше сработает fallback на методы по gamma_g).
     """
-    # Шаг 1. Нормализуем отсутствующие значения к нулю.
-    ch4 = max(methane_mol_frac or 0.0, 0.0)
-    c2h6 = max(ethane_mol_frac or 0.0, 0.0)
-    total = ch4 + c2h6
+    # Шаг 1. Приоритетно читаем расширенный состав, если он передан.
+    if composition_mol_frac:
+        collected: Dict[str, float] = {}
+        for raw_name, value in composition_mol_frac.items():
+            canonical = raw_name.strip().upper()
+            if canonical not in COMPONENT_CRITICAL_PROPS:
+                continue
+            if value <= 0.0:
+                continue
+            collected[canonical] = collected.get(canonical, 0.0) + float(value)
 
-    # Шаг 2. Если состав не задан, возвращаем None и далее используем Sutton.
-    if total <= 0.0:
-        return None
+        total = sum(collected.values())
+        if total > 0.0:
+            return {name: val / total for name, val in collected.items()}
 
-    # Шаг 3. Нормируем известные компоненты до единицы.
-    return {"CH4": ch4 / total, "C2H6": c2h6 / total}
+    # Шаг 2. Если состав не задан, возвращаем None.
+    return None
 
 
 def pseudo_critical_sutton_pa_k(gamma_g: float) -> Tuple[float, float]:
     """
     Возвращает псевдокритические параметры газа по Sutton.
 
-    Почему эта зависимость:
-    - Быстрый и устойчивый инженерный baseline, когда известна только gamma_g.
-
-    Ссылки:
-    - Sutton, R.P. (1985), ppc/tpc from gas specific gravity.
+    Роль:
+    - fallback-метод, когда компонентный состав неизвестен.
     """
     # Шаг 1. Расчет псевдокритической температуры (R) по gamma_g.
     t_pc_r = 169.2 + 349.5 * gamma_g - 74.0 * gamma_g**2
@@ -77,59 +101,116 @@ def pseudo_critical_sutton_pa_k(gamma_g: float) -> Tuple[float, float]:
     return p_pc_pa, t_pc_k
 
 
-def pseudo_critical_composition_pa_k(composition_mol_frac: Dict[str, float] | None) -> Tuple[float, float] | None:
+def pseudo_critical_by_composition_linear_pa_k(
+    composition_mol_frac: Dict[str, float] | None,
+) -> Tuple[float, float] | None:
     """
-    Возвращает псевдокритические параметры по составу (правило Кея).
+    Псевдокритические параметры по формулам (II.12)-(II.13), Инструкция 1980.
 
-    Почему эта зависимость:
-    - При известном составе физически предпочтительнее SG-корреляций уровня Sutton.
-    - Прямо соответствует подходу из пособия:
-      Инструкция (1980), гл. II.3, формулы (II.12)-(II.13).
+    Формулы:
+    - pпкр = Σ xi * pкр,i
+    - Tпкр = Σ xi * Tкр,i
     """
-    # Шаг 1. Проверяем наличие состава.
     if not composition_mol_frac:
         return None
 
-    # Шаг 2. Оставляем только компоненты, для которых есть критические параметры.
-    filtered: Dict[str, float] = {}
-    for component, value in composition_mol_frac.items():
-        if component in COMPONENT_CRITICAL_PROPS and value > 0.0:
-            filtered[component] = value
-
-    if not filtered:
-        return None
-
-    # Шаг 3. Нормируем доли и считаем Pпкр/Tпкр как сумму xi*Pкр,i и xi*Tкр,i.
-    total = sum(filtered.values())
+    # Шаг 1. Суммируем вклад каждого компонента.
     t_pc_k = 0.0
     p_pc_pa = 0.0
-    for component, value in filtered.items():
-        xi = value / total
+    for component, xi in composition_mol_frac.items():
         t_crit_k, p_crit_pa = COMPONENT_CRITICAL_PROPS[component]
         t_pc_k += xi * t_crit_k
         p_pc_pa += xi * p_crit_pa
+
+    if t_pc_k <= 0.0 or p_pc_pa <= 0.0:
+        return None
+    return p_pc_pa, t_pc_k
+
+
+def pseudo_critical_by_composition_precise_pa_k(
+    composition_mol_frac: Dict[str, float] | None,
+) -> Tuple[float, float] | None:
+    """
+    Псевдокритические параметры по формулам (II.14), Инструкция 1980.
+
+    Формулы:
+    - pпкр = K^2 / J^2
+    - Tпкр = K^2 / J
+    - K = Σ xi * (Tкр,i / sqrt(pкр,i))
+    - J = 1/8 Σi Σj xi xj [ (Tкр,i/pкр,i)^(1/3) + (Tкр,j/pкр,j)^(1/3) ]^3
+    """
+    if not composition_mol_frac:
+        return None
+
+    # Шаг 1. Считаем коэффициент K.
+    k_value = 0.0
+    for component, xi in composition_mol_frac.items():
+        t_crit_k, p_crit_pa = COMPONENT_CRITICAL_PROPS[component]
+        k_value += xi * (t_crit_k / math.sqrt(p_crit_pa))
+
+    # Шаг 2. Считаем коэффициент J двойной суммой.
+    j_value = 0.0
+    items = list(composition_mol_frac.items())
+    for component_i, xi in items:
+        t_crit_i, p_crit_i = COMPONENT_CRITICAL_PROPS[component_i]
+        theta_i = (t_crit_i / p_crit_i) ** (1.0 / 3.0)
+        for component_j, xj in items:
+            t_crit_j, p_crit_j = COMPONENT_CRITICAL_PROPS[component_j]
+            theta_j = (t_crit_j / p_crit_j) ** (1.0 / 3.0)
+            j_value += xi * xj * ((theta_i + theta_j) ** 3)
+    j_value *= 0.125
+
+    if j_value <= 0.0:
+        return None
+
+    # Шаг 3. Получаем псевдокритические параметры.
+    t_pc_k = (k_value**2) / j_value
+    p_pc_pa = t_pc_k / j_value
+    if t_pc_k <= 0.0 or p_pc_pa <= 0.0:
+        return None
     return p_pc_pa, t_pc_k
 
 
 def pseudo_critical_pa_k(
     gamma_g: float,
-    methane_mol_frac: float | None = None,
-    ethane_mol_frac: float | None = None,
+    composition_mol_frac: Dict[str, float] | None = None,
+    method: str = "composition_linear",
 ) -> Tuple[float, float]:
     """
-    Возвращает псевдокритические параметры газа с приоритетом состава.
+    Возвращает псевдокритические параметры газа выбранным методом.
 
-    Логика выбора:
-    - Если доступен состав CH4/C2H6 -> используем составной метод (правило Кея, Инструкция 1980).
-    - Если состава нет -> fallback на Sutton.
+    Доступные методы:
+    - `composition_linear` (по составу, аддитивно);
+    - `composition_precise` (по составу, повышенная точность);
+    - `specific_gravity_sutton` (по относительной плотности).
     """
-    # Шаг 1. Пытаемся посчитать псевдокритические параметры по составу.
-    composition = _build_composition(methane_mol_frac, ethane_mol_frac)
-    pseudo_from_composition = pseudo_critical_composition_pa_k(composition)
-    if pseudo_from_composition is not None:
-        return pseudo_from_composition
+    # Шаг 1. Нормируем признак метода.
+    method_norm = method.strip().lower()
 
-    # Шаг 2. Если состав недоступен, используем Sutton.
+    # Шаг 2. Для составных методов собираем компонентный состав.
+    composition = _build_composition(
+        composition_mol_frac=composition_mol_frac,
+    )
+
+    # Шаг 3. Вычисляем по выбранной схеме.
+    if method_norm == "composition_precise":
+        ppc_tpc = pseudo_critical_by_composition_precise_pa_k(composition)
+        if ppc_tpc is not None:
+            return ppc_tpc
+        return pseudo_critical_sutton_pa_k(gamma_g)
+
+    if method_norm == "specific_gravity_sutton":
+        return pseudo_critical_sutton_pa_k(gamma_g)
+
+    if method_norm != "composition_linear":
+        raise ValueError(
+            f"Неизвестный ppc_method='{method}'. Допустимо: "
+            "composition_linear | composition_precise | specific_gravity_sutton."
+        )
+
+    ppc_tpc = pseudo_critical_by_composition_linear_pa_k(composition)
+    if ppc_tpc is not None:
+        return ppc_tpc
     return pseudo_critical_sutton_pa_k(gamma_g)
 
 
@@ -137,23 +218,18 @@ def z_factor_papay(
     pressure_pa: float,
     temperature_k: float,
     gamma_g: float,
-    methane_mol_frac: float | None = None,
-    ethane_mol_frac: float | None = None,
+    composition_mol_frac: Dict[str, float] | None = None,
+    ppc_method: str = "composition_linear",
 ) -> float:
-    """
-    Оценивает коэффициент сверхсжимаемости Z по корреляции Papay.
-
-    Роль в проекте:
-    - Сохранен как альтернативный/контрольный метод.
-    """
+    """Оценивает коэффициент сверхсжимаемости Z по корреляции Papay."""
     # Шаг 1. Получаем псевдокритические параметры выбранным способом.
     p_pc_pa, t_pc_k = pseudo_critical_pa_k(
         gamma_g=gamma_g,
-        methane_mol_frac=methane_mol_frac,
-        ethane_mol_frac=ethane_mol_frac,
+        composition_mol_frac=composition_mol_frac,
+        method=ppc_method,
     )
 
-    # Шаг 2. Считаем приведенные параметры и ограничиваем снизу для численной устойчивости.
+    # Шаг 2. Считаем приведенные параметры.
     pr = max(pressure_pa / p_pc_pa, 0.01)
     tr = max(temperature_k / t_pc_k, 1.01)
 
@@ -162,13 +238,64 @@ def z_factor_papay(
     return max(z, 0.2)
 
 
-def _dak_z_from_rhor(rho_r: float, t_pr: float) -> float:
+def z_factor_aliev_zotov_two_parameter(
+    pressure_pa: float,
+    temperature_k: float,
+    gamma_g: float,
+    composition_mol_frac: Dict[str, float] | None = None,
+    ppc_method: str = "composition_linear",
+    max_iter: int = 80,
+) -> float:
     """
-    Вычисляет Z по Dranchuk-Abou-Kassem для заданной приведенной плотности.
+    Оценивает Z по формуле (II.21), Инструкция 1980.
 
-    Ссылки:
-    - Dranchuk, Abou-Kassem (1975), Hall-Yarborough type explicit form in rho_r.
+    Используется неявное уравнение:
+    - z = 1/(1-h) - (a*2/b*) * h/(1+h),
+    где h = p*b*/z,
+      b* = 0.08677 * Tпкр / (pпкр*T),
+      a*2 = 0.42787 * Tпкр^2.5 / (pпкр*T^2.5).
     """
+    # Шаг 1. Получаем псевдокритические параметры газа.
+    p_pc_pa, t_pc_k = pseudo_critical_pa_k(
+        gamma_g=gamma_g,
+        composition_mol_frac=composition_mol_frac,
+        method=ppc_method,
+    )
+
+    # Шаг 2. Рассчитываем коэффициенты уравнения II.21.
+    b_star = 0.08677 * t_pc_k / (p_pc_pa * temperature_k)
+    a_star_2 = 0.42787 * (t_pc_k**2.5) / (p_pc_pa * (temperature_k**2.5))
+    ratio = a_star_2 / max(b_star, 1e-18)
+
+    # Шаг 3. Итерационно решаем неявное уравнение относительно z.
+    z = z_factor_papay(
+        pressure_pa=pressure_pa,
+        temperature_k=temperature_k,
+        gamma_g=gamma_g,
+        composition_mol_frac=composition_mol_frac,
+        ppc_method=ppc_method,
+    )
+
+    for _ in range(max_iter):
+        h = pressure_pa * b_star / max(z, 1e-9)
+        # Ограничиваем h, чтобы не попадать в особую точку 1/(1-h).
+        h = min(max(h, -0.99), 0.99)
+
+        z_new = 1.0 / (1.0 - h) - ratio * (h / (1.0 + h))
+        if not math.isfinite(z_new):
+            z_new = z
+        z_new = max(min(z_new, 3.0), 0.2)
+
+        if abs(z_new - z) / max(z, 1e-9) < 1e-7:
+            z = z_new
+            break
+        z = 0.5 * z + 0.5 * z_new
+
+    return max(min(z, 3.0), 0.2)
+
+
+def _dak_z_from_rhor(rho_r: float, t_pr: float) -> float:
+    """Вычисляет Z по Dranchuk-Abou-Kassem для заданной приведенной плотности."""
     a1 = 0.3265
     a2 = -1.0700
     a3 = -0.5339
@@ -195,12 +322,7 @@ def _dak_z_from_rhor(rho_r: float, t_pr: float) -> float:
 
 
 def _dak_reduced_density(p_pr: float, t_pr: float, max_iter: int = 40) -> float:
-    """
-    Решает неявное уравнение DAK относительно приведенной плотности rho_r.
-
-    Роль в проекте:
-    - Позволяет получить более точный Z(P,T), чем Papay, без графиков.
-    """
+    """Решает неявное уравнение DAK относительно приведенной плотности rho_r."""
     # Шаг 1. Стартовая оценка rho_r из допущения Z≈1.
     rho_r = max(0.27 * p_pr / max(t_pr, 1e-9), 1e-6)
 
@@ -233,26 +355,15 @@ def z_factor_dak(
     pressure_pa: float,
     temperature_k: float,
     gamma_g: float,
-    methane_mol_frac: float | None = None,
-    ethane_mol_frac: float | None = None,
+    composition_mol_frac: Dict[str, float] | None = None,
+    ppc_method: str = "composition_linear",
 ) -> float:
-    """
-    Оценивает коэффициент сверхсжимаемости Z по Dranchuk-Abou-Kassem.
-
-    Почему выбрано как дефолт:
-    - Более детальная аналитическая аппроксимация по сравнению с Papay.
-    - Не требует ручного чтения графиков из старых методик.
-    - Удобна для автоматического многовариантного анализа.
-
-    Сопоставление с пособием:
-    - В Инструкции (1980), гл. II.5, предложены графические и аналитические методы.
-    - Для кода и серии сценариев DAK обычно практичнее и воспроизводимее.
-    """
+    """Оценивает коэффициент сверхсжимаемости Z по Dranchuk-Abou-Kassem."""
     # Шаг 1. Получаем псевдокритические параметры выбранным способом.
     p_pc_pa, t_pc_k = pseudo_critical_pa_k(
         gamma_g=gamma_g,
-        methane_mol_frac=methane_mol_frac,
-        ethane_mol_frac=ethane_mol_frac,
+        composition_mol_frac=composition_mol_frac,
+        method=ppc_method,
     )
 
     # Шаг 2. Считаем приведенные параметры.
@@ -266,11 +377,7 @@ def z_factor_dak(
 
 
 def gas_density_kgm3(pressure_pa: float, temperature_k: float, z_factor: float, gamma_g: float) -> float:
-    """
-    Вычисляет плотность газа по уравнению состояния реального газа.
-
-    Эта функция нужна в гидравлике ствола для Re, потерь трения и гравитационной составляющей.
-    """
+    """Вычисляет плотность газа по уравнению состояния реального газа."""
     # Шаг 1. Переводим относительную плотность в молярную массу газа.
     molar_mass = gamma_g * M_AIR
     # Шаг 2. Считаем плотность через pM/(ZRT).
@@ -283,17 +390,7 @@ def gas_viscosity_pa_s_lee(
     z_factor: float,
     gamma_g: float,
 ) -> float:
-    """
-    Оценивает вязкость газа по Lee-Gonzalez-Eakin.
-
-    Почему эта зависимость:
-    - Стандартная промышленная корреляция для инженерных расчетов сухого газа.
-    - Использует P, T и плотность газа, что соответствует вашему ТЗ по μ(P,T).
-
-    Ссылки:
-    - Lee, Gonzalez, Eakin (1966), gas viscosity correlation.
-    - «2.3 АН 2021», стр. 50-51 (требование учитывать μ(P,T)).
-    """
+    """Оценивает вязкость газа по Lee-Gonzalez-Eakin."""
     # Шаг 1. Определяем молекулярную массу и текущую плотность газа.
     molar_mass_g = gamma_g * 28.9652
     rho_kgm3 = gas_density_kgm3(pressure_pa, temperature_k, z_factor, gamma_g)
@@ -315,9 +412,9 @@ def gas_properties(
     pressure_pa: float,
     temperature_k: float,
     gamma_g: float,
-    methane_mol_frac: float | None = None,
-    ethane_mol_frac: float | None = None,
-    z_method: str = "dak",
+    composition_mol_frac: Dict[str, float] | None = None,
+    ppc_method: str = "composition_linear",
+    z_method: str = "dranchuk_abou_kassem",
 ) -> Tuple[float, float, float]:
     """
     Комплексный вызов блока PVT.
@@ -326,9 +423,6 @@ def gas_properties(
     - Z(P,T),
     - μ(P,T),
     - ρ(P,T).
-
-    Роль в проекте:
-    - Используется и в притоке (коэффициенты A/B), и в гидравлике ствола.
     """
     # Шаг 1. Считаем коэффициент сверхсжимаемости выбранной корреляцией.
     method = z_method.lower().strip()
@@ -337,16 +431,29 @@ def gas_properties(
             pressure_pa=pressure_pa,
             temperature_k=temperature_k,
             gamma_g=gamma_g,
-            methane_mol_frac=methane_mol_frac,
-            ethane_mol_frac=ethane_mol_frac,
+            composition_mol_frac=composition_mol_frac,
+            ppc_method=ppc_method,
         )
-    else:
+    elif method == "aliev_zotov_two_parameter":
+        z = z_factor_aliev_zotov_two_parameter(
+            pressure_pa=pressure_pa,
+            temperature_k=temperature_k,
+            gamma_g=gamma_g,
+            composition_mol_frac=composition_mol_frac,
+            ppc_method=ppc_method,
+        )
+    elif method == "dranchuk_abou_kassem":
         z = z_factor_dak(
             pressure_pa=pressure_pa,
             temperature_k=temperature_k,
             gamma_g=gamma_g,
-            methane_mol_frac=methane_mol_frac,
-            ethane_mol_frac=ethane_mol_frac,
+            composition_mol_frac=composition_mol_frac,
+            ppc_method=ppc_method,
+        )
+    else:
+        raise ValueError(
+            f"Неизвестный z_method='{z_method}'. Допустимо: "
+            "dranchuk_abou_kassem | aliev_zotov_two_parameter | papay."
         )
 
     # Шаг 2. Считаем вязкость.

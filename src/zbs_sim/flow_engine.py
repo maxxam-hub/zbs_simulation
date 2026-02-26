@@ -60,8 +60,8 @@ def _coefficients_for_scenario(cfg: BaseConfig, scenario: Scenario, p_avg_pa: fl
         pressure_pa=p_avg_pa,
         temperature_k=t_k,
         gamma_g=cfg.reservoir.gamma_g,
-        methane_mol_frac=cfg.reservoir.methane_mol_frac,
-        ethane_mol_frac=cfg.reservoir.ethane_mol_frac,
+        composition_mol_frac=cfg.reservoir.gas_composition_mol_frac,
+        ppc_method=cfg.reservoir.ppc_method,
         z_method=cfg.reservoir.z_method,
     )
     # Шаг 2. Переводим проницаемость в SI и считаем геометрический множитель сопротивления.
@@ -181,8 +181,8 @@ def simulate_vertical_reference(cfg: BaseConfig) -> float:
         pressure_pa=p_avg_pa,
         temperature_k=t_k,
         gamma_g=cfg.reservoir.gamma_g,
-        methane_mol_frac=cfg.reservoir.methane_mol_frac,
-        ethane_mol_frac=cfg.reservoir.ethane_mol_frac,
+        composition_mol_frac=cfg.reservoir.gas_composition_mol_frac,
+        ppc_method=cfg.reservoir.ppc_method,
         z_method=cfg.reservoir.z_method,
     )
     k_m2 = md_to_m2(cfg.reservoir.k_mD)

@@ -72,8 +72,8 @@ def _segment_drop_pa(
         pressure_pa=pressure_ref_pa,
         temperature_k=t_k,
         gamma_g=cfg.reservoir.gamma_g,
-        methane_mol_frac=cfg.reservoir.methane_mol_frac,
-        ethane_mol_frac=cfg.reservoir.ethane_mol_frac,
+        composition_mol_frac=cfg.reservoir.gas_composition_mol_frac,
+        ppc_method=cfg.reservoir.ppc_method,
         z_method=cfg.reservoir.z_method,
     )
 

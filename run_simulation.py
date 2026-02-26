@@ -29,6 +29,12 @@ def main() -> None:
     cfg = default_config()
     output_dir = ROOT / cfg.output.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Метод псевдокритических параметров: {cfg.reservoir.ppc_method}")
+    print(f"Метод расчета Z-фактора: {cfg.reservoir.z_method}")
+    if cfg.reservoir.gas_composition_mol_frac:
+        print("Используется расширенный компонентный состав газа.")
+    else:
+        print("Компонентный состав газа не задан, используются fallback-методы по относительной плотности газа.")
 
     # Шаг 2. Выполняем полный перебор сценариев.
     records = run_sensitivity(cfg)

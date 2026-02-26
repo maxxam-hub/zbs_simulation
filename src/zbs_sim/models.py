@@ -18,9 +18,17 @@ class ReservoirParams:
     ae_default: float = 0.2
     macro_l: float = 1.0
     gamma_g: float = 0.693
-    methane_mol_frac: float = 0.9623
-    ethane_mol_frac: float = 0.0302
-    z_method: str = "dak"
+    gas_composition_mol_frac: dict[str, float] = field(
+        default_factory=lambda: {
+            "CH4": 0.9623,
+            "C2H6": 0.0302,
+        }
+    )
+    # Названия методик:
+    # ppc_method: composition_linear | composition_precise | specific_gravity_sutton
+    # z_method: dranchuk_abou_kassem | aliev_zotov_two_parameter | papay
+    ppc_method: str = "composition_linear"
+    z_method: str = "dranchuk_abou_kassem"
     cgf_g_m3: float = 0.85
     skin: float = 0.0
 
