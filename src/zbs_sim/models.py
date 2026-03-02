@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Sequence
 
-ProfileType = Literal["flat", "ascending"]
+ProfileType = Literal["flat", "ascending", "descending", "stepped"]
+InflowMethod = Literal["legacy_empirical", "aliev_2015_anisotropic"]
+PwfMode = Literal["pwf_const", "pwf_variable_iterative"]
 
 
 @dataclass(frozen=True)
@@ -27,10 +29,19 @@ class ReservoirParams:
     # Названия методик:
     # ppc_method: composition_linear | composition_precise | specific_gravity_sutton
     # z_method: dranchuk_abou_kassem | aliev_zotov_two_parameter | papay
+    # inflow_method: legacy_empirical | aliev_2015_anisotropic
+    # pwf_mode: pwf_const | pwf_variable_iterative
     ppc_method: str = "composition_linear"
     z_method: str = "dranchuk_abou_kassem"
+    inflow_method: InflowMethod = "legacy_empirical"
+    pwf_mode: PwfMode = "pwf_variable_iterative"
     cgf_g_m3: float = 0.85
     skin: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Проверяет базовые физические ограничения параметров пласта."""
+        if not (0.0 < self.ae_default <= 1.0):
+            raise ValueError("Параметр ae_default должен быть в диапазоне 0 < ae <= 1.")
 
 
 @dataclass(frozen=True)
@@ -45,6 +56,22 @@ class WellboreParams:
     drainage_radius_m: float = 600.0
     entry_from_roof_m: float = 20.0
     ascending_angle_deg: float = 6.0
+    # Параметры ступенчатого профиля (задаются вручную):
+    # - stepped_segment_lengths_m: длины горизонтальных ступеней;
+    # - stepped_step_heights_m: перепады высоты между соседними ступенями (положительные/отрицательные).
+    stepped_segment_lengths_m: Sequence[float] = (300.0, 300.0, 300.0)
+    stepped_step_heights_m: Sequence[float] = (1.5, 1.5)
+
+    def __post_init__(self) -> None:
+        """Проверяет корректность параметров ступенчатого профиля."""
+        if any(length <= 0.0 for length in self.stepped_segment_lengths_m):
+            raise ValueError("Все значения stepped_segment_lengths_m должны быть > 0.")
+        expected_heights = max(len(self.stepped_segment_lengths_m) - 1, 0)
+        if len(self.stepped_step_heights_m) != expected_heights:
+            raise ValueError(
+                "Длина stepped_step_heights_m должна быть равна (количество ступеней - 1), "
+                "то есть len(stepped_segment_lengths_m) - 1."
+            )
 
 
 @dataclass(frozen=True)
@@ -71,9 +98,14 @@ class SweepParams:
 
     lateral_lengths_m: Sequence[int] = tuple(range(100, 1501, 100))
     curvature_radii_m: Sequence[float] = (8.0, 40.0, 120.0)
-    profiles: Sequence[ProfileType] = ("flat", "ascending")
+    profiles: Sequence[ProfileType] = ("flat", "ascending", "descending", "stepped")
     anisotropy_values: Sequence[float] = (0.1, 0.2, 0.3)
     shoe_step_m: float = 100.0
+
+    def __post_init__(self) -> None:
+        """Проверяет диапазон перебираемых значений анизотропии."""
+        if any((value <= 0.0 or value > 1.0) for value in self.anisotropy_values):
+            raise ValueError("Все значения anisotropy_values должны быть в диапазоне 0 < ae <= 1.")
 
 
 @dataclass(frozen=True)
@@ -92,6 +124,11 @@ class Scenario:
     profile: ProfileType
     tubing_shoe_from_heel_m: float
     anisotropy_ae: float
+
+    def __post_init__(self) -> None:
+        """Проверяет корректность анизотропии для конкретного сценария."""
+        if not (0.0 < self.anisotropy_ae <= 1.0):
+            raise ValueError("Параметр anisotropy_ae должен быть в диапазоне 0 < ae <= 1.")
 
 
 @dataclass(frozen=True)

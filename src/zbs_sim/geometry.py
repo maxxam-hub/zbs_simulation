@@ -57,12 +57,80 @@ def toe_elevation_gain_m(scenario: Scenario, wellbore: WellboreParams) -> float:
     Роль в проекте:
     - Нужен для гравитационной части потерь давления в стволе.
     """
-    # Шаг 1. Для плоского профиля высотный перепад отсутствует.
+    # Шаг 1. Берем высоту носка ствола относительно пятки на конечной длине.
+    return elevation_at_distance_m(scenario, wellbore, scenario.lateral_length_m)
+
+
+def _scaled_stepped_lengths(scenario: Scenario, wellbore: WellboreParams) -> List[float]:
+    """
+    Возвращает длины ступеней, масштабированные под фактическую длину ГС сценария.
+
+    Почему так:
+    - пользователь задает шаблон ступеней в конфиге;
+    - при переборе Lг шаблон масштабируется, сохраняя относительную структуру.
+    """
+    lateral = max(scenario.lateral_length_m, 0.0)
+    if lateral <= 0.0:
+        return []
+    base = [float(value) for value in wellbore.stepped_segment_lengths_m if float(value) > 0.0]
+    if not base:
+        return [lateral]
+    total = sum(base)
+    if total <= 0.0:
+        return [lateral]
+    scale = lateral / total
+    return [value * scale for value in base]
+
+
+def elevation_at_distance_m(scenario: Scenario, wellbore: WellboreParams, distance_m: float) -> float:
+    """
+    Возвращает высоту ствола относительно пятки в точке distance_m вдоль ГС.
+
+    Профили:
+    - flat: постоянная высота;
+    - ascending: линейный набор высоты;
+    - descending: линейное снижение высоты;
+    - stepped: горизонтальные ступени с заданными перепадами между ними.
+    """
+    lateral = max(scenario.lateral_length_m, 0.0)
+    if lateral <= 0.0:
+        return 0.0
+    x = min(max(distance_m, 0.0), lateral)
+
+    # Шаг 1. Плоский профиль.
     if scenario.profile == "flat":
         return 0.0
-    # Шаг 2. Для восходящего профиля считаем геометрию по углу.
-    angle_rad = math.radians(wellbore.ascending_angle_deg)
-    return scenario.lateral_length_m * math.tan(angle_rad)
+
+    # Шаг 2. Линейные профили по углу.
+    if scenario.profile in ("ascending", "descending"):
+        sign = 1.0 if scenario.profile == "ascending" else -1.0
+        angle_rad = math.radians(abs(wellbore.ascending_angle_deg))
+        return sign * x * math.tan(angle_rad)
+
+    # Шаг 3. Ступенчатый профиль.
+    if scenario.profile == "stepped":
+        lengths = _scaled_stepped_lengths(scenario, wellbore)
+        if not lengths:
+            return 0.0
+        heights = list(float(value) for value in wellbore.stepped_step_heights_m)
+        expected = max(len(lengths) - 1, 0)
+        if len(heights) < expected:
+            heights.extend([0.0] * (expected - len(heights)))
+        elif len(heights) > expected:
+            heights = heights[:expected]
+
+        current_x = 0.0
+        elevation = 0.0
+        for index, segment_len in enumerate(lengths):
+            next_x = current_x + segment_len
+            if x < next_x - 1e-9:
+                return elevation
+            if index < len(heights):
+                elevation += heights[index]
+            current_x = next_x
+        return elevation
+
+    raise ValueError(f"Неизвестный профиль '{scenario.profile}'.")
 
 
 def resistance_term(
@@ -87,6 +155,8 @@ def resistance_term(
     # Шаг 2. Снижение сопротивления с ростом длины ГС.
     lateral_gain = 1.0 + math.log1p(scenario.lateral_length_m / max(reservoir.h_m, 0.1))
     # Шаг 3. Учет анизотропии через ae = sqrt(kv/kh): меньший ae -> выше сопротивление.
+    if not (0.0 < scenario.anisotropy_ae <= 1.0):
+        raise ValueError("Параметр anisotropy_ae должен быть в диапазоне 0 < ae <= 1.")
     anisotropy_mult = 1.0 / max(scenario.anisotropy_ae, 0.05)
 
     # Шаг 4. Учет асимметрии положения ствола в разрезе пласта (h1 относительно середины пласта).

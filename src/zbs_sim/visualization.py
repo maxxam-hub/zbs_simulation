@@ -13,6 +13,16 @@ from .flow_engine import simulate_scenario
 from .models import BaseConfig, Scenario
 
 
+def _profile_ru(profile: str) -> str:
+    """Возвращает русское имя профиля для подписей в графиках и CSV."""
+    return {
+        "flat": "плоско-горизонтальный",
+        "ascending": "восходящий",
+        "descending": "нисходящий",
+        "stepped": "ступенчатый",
+    }.get(profile, profile)
+
+
 def _isclose(left: float, right: float, tol: float = 1e-9) -> bool:
     """Проверяет близость чисел с заданным допуском."""
     return abs(left - right) <= tol
@@ -215,6 +225,131 @@ def save_anisotropy_plot(records: list[dict], cfg: BaseConfig, output_path: Path
     plt.xlabel("Длина горизонтального участка, м")
     plt.ylabel("Дебит, тыс. ст.м3/сут")
     plt.title("Влияние анизотропии на выбор длины ГС")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+    return True
+
+
+def save_profile_rate_comparison_plot(records: list[dict], cfg: BaseConfig, output_path: Path) -> bool:
+    """
+    Строит сравнение дебита Q(L) для разных профилей ГС при фиксированных Rкр, ae и башмаке у забоя.
+
+    Роль:
+    - отдельный график сравнения профилей: flat, ascending, descending, stepped.
+    """
+    # Шаг 1. Отбираем сопоставимые сценарии.
+    base_radius = cfg.sweep.curvature_radii_m[1] if len(cfg.sweep.curvature_radii_m) > 1 else cfg.sweep.curvature_radii_m[0]
+    selection = [
+        row
+        for row in records
+        if _isclose(float(row["ae"]), cfg.reservoir.ae_default)
+        and _isclose(float(row["curvature_radius_m"]), float(base_radius))
+        and _isclose(float(row["shoe_fraction"]), 1.0)
+    ]
+    if not selection:
+        return False
+
+    profiles = sorted({str(row["profile"]) for row in selection})
+
+    # Шаг 2. Fallback в CSV при отсутствии matplotlib.
+    if plt is None:
+        rows_ru = [
+            {
+                "Профиль": _profile_ru(str(row["profile"])),
+                "Lг_м": row["lateral_length_m"],
+                "Дебит_тыс_стм3_сут": row["q_std_th_m3_day"],
+            }
+            for row in selection
+        ]
+        _write_records_csv(output_path.with_suffix(".csv"), rows_ru, ["Профиль", "Lг_м", "Дебит_тыс_стм3_сут"])
+        return False
+
+    # Шаг 3. Построение кривых.
+    plt.figure(figsize=(10, 5))
+    for profile in profiles:
+        sub = sorted(
+            [row for row in selection if str(row["profile"]) == profile],
+            key=lambda item: float(item["lateral_length_m"]),
+        )
+        if not sub:
+            continue
+        xs = [float(row["lateral_length_m"]) for row in sub]
+        ys = [float(row["q_std_th_m3_day"]) for row in sub]
+        plt.plot(xs, ys, marker="o", label=_profile_ru(profile))
+
+    # Шаг 4. Оформление.
+    plt.xlabel("Длина горизонтального участка, м")
+    plt.ylabel("Дебит, тыс. ст.м3/сут")
+    plt.title("Сравнение профилей ГС: зависимость дебита от длины")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+    return True
+
+
+def save_profile_pressure_comparison_plot(cfg: BaseConfig, output_path: Path) -> bool:
+    """
+    Строит сравнение распределения давления P(x) по стволу для разных профилей ГС.
+    """
+    # Шаг 1. Формируем единый базовый сценарий сравнения профилей.
+    lateral = 900.0
+    radius = 40.0
+    ae = cfg.reservoir.ae_default
+    shoe = lateral
+    profiles = list(cfg.sweep.profiles)
+
+    # Шаг 2. Fallback в CSV при отсутствии matplotlib.
+    if plt is None:
+        rows_ru: list[dict] = []
+        for profile in profiles:
+            scenario = Scenario(
+                lateral_length_m=lateral,
+                curvature_radius_m=radius,
+                profile=profile,
+                tubing_shoe_from_heel_m=shoe,
+                anisotropy_ae=ae,
+            )
+            result = simulate_scenario(cfg, scenario)
+            xs, ps = pressure_profile_heel_to_toe(cfg, scenario, q_std_m3s=result.q_std_m3_day / 86400.0)
+            for x, p in zip(xs, ps):
+                rows_ru.append(
+                    {
+                        "Профиль": _profile_ru(profile),
+                        "Расстояние_от_пятки_м": x,
+                        "Давление_МПа": p,
+                        "Дебит_тыс_стм3_сут": result.q_std_m3_day / 1000.0,
+                    }
+                )
+        _write_records_csv(
+            output_path.with_suffix(".csv"),
+            rows_ru,
+            ["Профиль", "Расстояние_от_пятки_м", "Давление_МПа", "Дебит_тыс_стм3_сут"],
+        )
+        return False
+
+    # Шаг 3. Построение кривых.
+    plt.figure(figsize=(10, 5))
+    for profile in profiles:
+        scenario = Scenario(
+            lateral_length_m=lateral,
+            curvature_radius_m=radius,
+            profile=profile,
+            tubing_shoe_from_heel_m=shoe,
+            anisotropy_ae=ae,
+        )
+        result = simulate_scenario(cfg, scenario)
+        xs, ps = pressure_profile_heel_to_toe(cfg, scenario, q_std_m3s=result.q_std_m3_day / 86400.0)
+        plt.plot(xs, ps, label=f"{_profile_ru(profile)}; Q={result.q_std_m3_day/1000.0:.1f} тыс.")
+
+    # Шаг 4. Оформление.
+    plt.xlabel("Расстояние от пятки к носку, м")
+    plt.ylabel("Давление, МПа")
+    plt.title("Сравнение профилей ГС: распределение давления по стволу")
     plt.grid(alpha=0.3)
     plt.legend()
     plt.tight_layout()

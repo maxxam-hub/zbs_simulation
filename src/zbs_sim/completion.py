@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Tuple
 
-from .geometry import toe_elevation_gain_m
+from .geometry import elevation_at_distance_m
 from .models import BaseConfig, Scenario
 from .reservoir import c_to_k, gas_properties, mpa_to_pa
 
@@ -109,45 +109,55 @@ def compute_wellbore_losses(
     if pressure_ref_pa is None:
         pressure_ref_pa = mpa_to_pa(cfg.operating.p_wf_heel_mpa)
 
-    # Шаг 2. Определяем длины сегментов НКТ и затруба.
+    # Шаг 2. Подготовка геометрии и разбиение ствола на расчетные ячейки.
     lateral = max(scenario.lateral_length_m, 0.0)
+    if lateral <= 0.0:
+        return WellboreLosses(tubing_drop_pa=0.0, annulus_drop_pa=0.0)
     shoe = min(max(scenario.tubing_shoe_from_heel_m, 0.0), lateral)
-    tubing_len = shoe
-    annulus_len = max(lateral - shoe, 0.0)
 
-    # Шаг 3. Оцениваем высотный перепад (важно для восходящего профиля).
-    toe_gain = toe_elevation_gain_m(scenario, cfg.wellbore)
-    dz_total_flow = -toe_gain
-
-    # Шаг 4. Распределяем гравитационную составляющую по сегментам пропорционально длине.
-    dz_tubing = dz_total_flow * (tubing_len / lateral) if lateral > 0.0 else 0.0
-    dz_annulus = dz_total_flow * (annulus_len / lateral) if lateral > 0.0 else 0.0
-
-    # Шаг 5. Считаем площади течения для НКТ и затрубного пространства.
+    # Шаг 3. Считаем площади течения для НКТ и затрубного пространства.
     tubing_area = math.pi * (cfg.wellbore.tubing_id_m**2) / 4.0
     annulus_area = math.pi * (cfg.wellbore.casing_id_m**2 - cfg.wellbore.tubing_od_m**2) / 4.0
 
-    # Шаг 6. Считаем потери по каждому сегменту.
-    dp_tubing = _segment_drop_pa(
-        q_std_m3s=q_std_m3s,
-        length_m=tubing_len,
-        hydraulic_diameter_m=cfg.wellbore.tubing_id_m,
-        flow_area_m2=tubing_area,
-        delta_z_flow_m=dz_tubing,
-        pressure_ref_pa=pressure_ref_pa,
-        cfg=cfg,
-    )
-    dp_annulus = _segment_drop_pa(
-        q_std_m3s=q_std_m3s,
-        length_m=annulus_len,
-        hydraulic_diameter_m=max(cfg.wellbore.casing_id_m - cfg.wellbore.tubing_od_m, 1e-4),
-        flow_area_m2=annulus_area,
-        delta_z_flow_m=dz_annulus,
-        pressure_ref_pa=pressure_ref_pa,
-        cfg=cfg,
-    )
+    # Шаг 4. Дискретно интегрируем потери вдоль ствола с учетом профиля и положения башмака.
+    cell_count = max(20, int(lateral / 25.0))
+    dx = lateral / cell_count
+    dp_tubing = 0.0
+    dp_annulus = 0.0
+    for index in range(cell_count):
+        x0 = index * dx
+        x1 = lateral if index == cell_count - 1 else (index + 1) * dx
+        x_mid = 0.5 * (x0 + x1)
+        dz_geom = elevation_at_distance_m(scenario, cfg.wellbore, x1) - elevation_at_distance_m(
+            scenario, cfg.wellbore, x0
+        )
+        # Для расчета давления вдоль трассы пятка->носок используем знак, согласованный с текущей постановкой потерь.
+        delta_z_flow = -dz_geom
 
-    # Шаг 7. Возвращаем структуру с отдельными и суммарными потерями.
+        if x_mid <= shoe:
+            dp = _segment_drop_pa(
+                q_std_m3s=q_std_m3s,
+                length_m=x1 - x0,
+                hydraulic_diameter_m=cfg.wellbore.tubing_id_m,
+                flow_area_m2=tubing_area,
+                delta_z_flow_m=delta_z_flow,
+                pressure_ref_pa=pressure_ref_pa,
+                cfg=cfg,
+            )
+            dp_tubing += dp
+        else:
+            dp = _segment_drop_pa(
+                q_std_m3s=q_std_m3s,
+                length_m=x1 - x0,
+                hydraulic_diameter_m=max(cfg.wellbore.casing_id_m - cfg.wellbore.tubing_od_m, 1e-4),
+                flow_area_m2=annulus_area,
+                delta_z_flow_m=delta_z_flow,
+                pressure_ref_pa=pressure_ref_pa,
+                cfg=cfg,
+            )
+            dp_annulus += dp
+
+    # Шаг 5. Возвращаем структуру с отдельными и суммарными потерями.
     return WellboreLosses(tubing_drop_pa=dp_tubing, annulus_drop_pa=dp_annulus)
 
 
@@ -168,33 +178,51 @@ def pressure_profile_heel_to_toe(
     if lateral == 0.0:
         return [0.0], [cfg.operating.p_wf_heel_mpa]
 
-    # Шаг 2. Получаем потери давления по сегментам.
+    # Шаг 2. Подготавливаем базовые параметры и геометрию.
     p_heel_pa = mpa_to_pa(cfg.operating.p_wf_heel_mpa)
-    losses = compute_wellbore_losses(cfg, scenario, q_std_m3s, pressure_ref_pa=p_heel_pa)
-
-    # Шаг 3. Разбиваем ствол на НКТ и затруб.
     shoe = min(max(scenario.tubing_shoe_from_heel_m, 0.0), lateral)
-    tubing_len = shoe
-    annulus_len = max(lateral - shoe, 0.0)
+    tubing_area = math.pi * (cfg.wellbore.tubing_id_m**2) / 4.0
+    annulus_area = math.pi * (cfg.wellbore.casing_id_m**2 - cfg.wellbore.tubing_od_m**2) / 4.0
 
-    # Шаг 4. Формируем сетку координат вдоль ствола.
+    # Шаг 3. Формируем сетку координат вдоль ствола.
     if points < 2:
         points = 2
     step = lateral / (points - 1)
     xs = [i * step for i in range(points)]
-    ps_pa: List[float] = []
+    ps_pa: List[float] = [p_heel_pa]
 
-    # Шаг 5. На каждой точке рассчитываем давление кусочно-линейно по сегментам.
-    p_shoe_pa = p_heel_pa + losses.tubing_drop_pa
-    for x in xs:
-        if tubing_len > 0.0 and x <= tubing_len:
-            p = p_heel_pa + losses.tubing_drop_pa * (x / tubing_len)
-        elif annulus_len > 0.0 and x > tubing_len:
-            p = p_shoe_pa + losses.annulus_drop_pa * ((x - tubing_len) / annulus_len)
+    # Шаг 4. Интегрируем давление от пятки к носку по расчетным участкам.
+    for index in range(1, len(xs)):
+        x0 = xs[index - 1]
+        x1 = xs[index]
+        x_mid = 0.5 * (x0 + x1)
+        dz_geom = elevation_at_distance_m(scenario, cfg.wellbore, x1) - elevation_at_distance_m(
+            scenario, cfg.wellbore, x0
+        )
+        delta_z_flow = -dz_geom
+
+        if x_mid <= shoe:
+            dp = _segment_drop_pa(
+                q_std_m3s=q_std_m3s,
+                length_m=x1 - x0,
+                hydraulic_diameter_m=cfg.wellbore.tubing_id_m,
+                flow_area_m2=tubing_area,
+                delta_z_flow_m=delta_z_flow,
+                pressure_ref_pa=max(ps_pa[-1], 100_000.0),
+                cfg=cfg,
+            )
         else:
-            p = p_heel_pa
-        ps_pa.append(p)
+            dp = _segment_drop_pa(
+                q_std_m3s=q_std_m3s,
+                length_m=x1 - x0,
+                hydraulic_diameter_m=max(cfg.wellbore.casing_id_m - cfg.wellbore.tubing_od_m, 1e-4),
+                flow_area_m2=annulus_area,
+                delta_z_flow_m=delta_z_flow,
+                pressure_ref_pa=max(ps_pa[-1], 100_000.0),
+                cfg=cfg,
+            )
+        ps_pa.append(ps_pa[-1] + dp)
 
-    # Шаг 6. Переводим давление в МПа для отчетности и графиков.
+    # Шаг 5. Переводим давление в МПа для отчетности и графиков.
     ps_mpa = [value / 1_000_000.0 for value in ps_pa]
     return xs, ps_mpa

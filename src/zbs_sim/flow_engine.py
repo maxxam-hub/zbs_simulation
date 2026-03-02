@@ -4,7 +4,8 @@ import math
 from dataclasses import dataclass
 
 from .completion import WellboreLosses, compute_wellbore_losses
-from .geometry import resistance_term, vertical_resistance_term
+from .geometry import vertical_resistance_term
+from .inflow import compute_ab
 from .models import BaseConfig, Scenario
 from .reservoir import c_to_k, gas_properties, md_to_m2, mpa_to_pa
 
@@ -54,49 +55,8 @@ def _coefficients_for_scenario(cfg: BaseConfig, scenario: Scenario, p_avg_pa: fl
     - Алиев (1995), стр. 56: инженерный вид A/B-параметризации.
     - «муг хитёв.pdf», стр. 26: коэффициент макрошероховатости l для инерционного члена B.
     """
-    # Шаг 1. Получаем PVT-свойства газа на среднем давлении сценария.
-    t_k = c_to_k(cfg.reservoir.t_res_c)
-    z, mu, _ = gas_properties(
-        pressure_pa=p_avg_pa,
-        temperature_k=t_k,
-        gamma_g=cfg.reservoir.gamma_g,
-        composition_mol_frac=cfg.reservoir.gas_composition_mol_frac,
-        ppc_method=cfg.reservoir.ppc_method,
-        z_method=cfg.reservoir.z_method,
-    )
-    # Шаг 2. Переводим проницаемость в SI и считаем геометрический множитель сопротивления.
-    k_m2 = md_to_m2(cfg.reservoir.k_mD)
-    psi = resistance_term(cfg.reservoir, cfg.wellbore, scenario)
-
-    # Шаг 3. Считаем линейный коэффициент A (вязкостная часть сопротивления).
-    a = (
-        cfg.calibration.a_scale
-        * mu
-        * z
-        * cfg.operating.std_p_pa
-        * t_k
-        * psi
-        / (math.pi * k_m2 * cfg.reservoir.h_m * cfg.operating.std_t_k)
-    )
-
-    # Шаг 4. Считаем квадратичный коэффициент B (инерционная часть).
-    b = (
-        cfg.calibration.b_scale
-        * cfg.reservoir.macro_l
-        * z
-        * cfg.operating.std_p_pa
-        * t_k
-        * (psi**1.1)
-        / (
-            math.pi
-            * math.pi
-            * k_m2
-            * cfg.reservoir.h_m
-            * max(scenario.lateral_length_m, 1.0)
-            * cfg.operating.std_t_k
-        )
-    )
-    return a, b
+    # Шаг 1. Вычисляем A/B выбранной методикой притока через inflow_method.
+    return compute_ab(cfg, scenario, p_avg_pa)
 
 
 def simulate_scenario(cfg: BaseConfig, scenario: Scenario, max_iter: int = 30) -> FlowResult:
@@ -110,44 +70,60 @@ def simulate_scenario(cfg: BaseConfig, scenario: Scenario, max_iter: int = 30) -
     p_res_pa = mpa_to_pa(cfg.reservoir.p_res_mpa)
     p_heel_pa = mpa_to_pa(cfg.operating.p_wf_heel_mpa)
 
-    # Шаг 2. Получаем начальную оценку q без учета перерасчета среднего давления вдоль ствола.
-    a0, b0 = _coefficients_for_scenario(cfg, scenario, 0.5 * (p_res_pa + p_heel_pa))
-    q_std_m3s = _quadratic_positive_root(p_res_pa * p_res_pa - p_heel_pa * p_heel_pa, a0, b0)
+    mode = cfg.reservoir.pwf_mode.strip().lower()
 
-    a_coeff = a0
-    b_coeff = b0
-    # Шаг 3. Считаем начальные потери давления в стволе.
-    losses = compute_wellbore_losses(cfg, scenario, q_std_m3s, pressure_ref_pa=0.5 * (p_res_pa + p_heel_pa))
+    # Шаг 2. Режим Pз = const: считаем дебит без итерационной увязки давления по стволу.
+    if mode == "pwf_const":
+        a_coeff, b_coeff = _coefficients_for_scenario(cfg, scenario, 0.5 * (p_res_pa + p_heel_pa))
+        q_std_m3s = _quadratic_positive_root(p_res_pa * p_res_pa - p_heel_pa * p_heel_pa, a_coeff, b_coeff)
+        losses = WellboreLosses(tubing_drop_pa=0.0, annulus_drop_pa=0.0)
+        p_toe_pa = p_heel_pa
+        p_avg_lateral_pa = p_heel_pa
+        iteration = 1
+    elif mode == "pwf_variable_iterative":
+        # Шаг 3. Получаем начальную оценку q для итерационного режима.
+        a0, b0 = _coefficients_for_scenario(cfg, scenario, 0.5 * (p_res_pa + p_heel_pa))
+        q_std_m3s = _quadratic_positive_root(p_res_pa * p_res_pa - p_heel_pa * p_heel_pa, a0, b0)
 
-    # Шаг 4. Итерационно согласуем приток и стволовые потери.
-    for iteration in range(1, max_iter + 1):
-        # Шаг 4.1. Обновляем среднее давление по горизонтальному участку.
-        p_toe_pa = p_heel_pa + losses.total_drop_pa
-        p_avg_lateral_pa = max(0.5 * (p_heel_pa + p_toe_pa), 100_000.0)
+        a_coeff = a0
+        b_coeff = b0
+        # Шаг 4. Считаем начальные потери давления в стволе.
+        losses = compute_wellbore_losses(cfg, scenario, q_std_m3s, pressure_ref_pa=0.5 * (p_res_pa + p_heel_pa))
 
-        # Шаг 4.2. Пересчитываем дебит по обновленному перепаду квадратов давления.
-        drawdown_p2 = p_res_pa * p_res_pa - p_avg_lateral_pa * p_avg_lateral_pa
-        if drawdown_p2 <= 0.0:
-            q_new = 0.0
+        # Шаг 5. Итерационно согласуем приток и стволовые потери.
+        for iteration in range(1, max_iter + 1):
+            # Шаг 5.1. Обновляем среднее давление по горизонтальному участку.
+            p_toe_pa = p_heel_pa + losses.total_drop_pa
+            p_avg_lateral_pa = max(0.5 * (p_heel_pa + p_toe_pa), 100_000.0)
+
+            # Шаг 5.2. Пересчитываем дебит по обновленному перепаду квадратов давления.
+            drawdown_p2 = p_res_pa * p_res_pa - p_avg_lateral_pa * p_avg_lateral_pa
+            if drawdown_p2 <= 0.0:
+                q_new = 0.0
+            else:
+                a_coeff, b_coeff = _coefficients_for_scenario(cfg, scenario, 0.5 * (p_res_pa + p_avg_lateral_pa))
+                q_new = _quadratic_positive_root(drawdown_p2, a_coeff, b_coeff)
+
+            # Шаг 5.3. Проверяем критерий сходимости по дебиту.
+            if q_std_m3s > 0.0 and abs(q_new - q_std_m3s) / q_std_m3s < 1e-4:
+                q_std_m3s = q_new
+                break
+
+            # Шаг 5.4. Выполняем релаксацию и пересчитываем потери.
+            q_std_m3s = 0.5 * q_std_m3s + 0.5 * q_new
+            losses = compute_wellbore_losses(cfg, scenario, q_std_m3s, pressure_ref_pa=max(p_avg_lateral_pa, 100_000.0))
         else:
-            a_coeff, b_coeff = _coefficients_for_scenario(cfg, scenario, 0.5 * (p_res_pa + p_avg_lateral_pa))
-            q_new = _quadratic_positive_root(drawdown_p2, a_coeff, b_coeff)
+            iteration = max_iter
 
-        # Шаг 4.3. Проверяем критерий сходимости по дебиту.
-        if q_std_m3s > 0.0 and abs(q_new - q_std_m3s) / q_std_m3s < 1e-4:
-            q_std_m3s = q_new
-            break
-
-        # Шаг 4.4. Выполняем релаксацию и пересчитываем потери.
-        q_std_m3s = 0.5 * q_std_m3s + 0.5 * q_new
-        losses = compute_wellbore_losses(cfg, scenario, q_std_m3s, pressure_ref_pa=max(p_avg_lateral_pa, 100_000.0))
+        # Шаг 6. Финальный пересчет выходных параметров после завершения итераций.
+        losses = compute_wellbore_losses(cfg, scenario, q_std_m3s, pressure_ref_pa=0.5 * (p_res_pa + p_heel_pa))
+        p_toe_pa = p_heel_pa + losses.total_drop_pa
+        p_avg_lateral_pa = 0.5 * (p_heel_pa + p_toe_pa)
     else:
-        iteration = max_iter
-
-    # Шаг 5. Финальный пересчет выходных параметров после завершения итераций.
-    losses = compute_wellbore_losses(cfg, scenario, q_std_m3s, pressure_ref_pa=0.5 * (p_res_pa + p_heel_pa))
-    p_toe_pa = p_heel_pa + losses.total_drop_pa
-    p_avg_lateral_pa = 0.5 * (p_heel_pa + p_toe_pa)
+        raise ValueError(
+            f"Неизвестный pwf_mode='{cfg.reservoir.pwf_mode}'. Допустимо: "
+            "pwf_const | pwf_variable_iterative."
+        )
 
     # Шаг 6. Упаковываем результат в удобную структуру.
     return FlowResult(

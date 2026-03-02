@@ -37,13 +37,23 @@ def run_sensitivity(cfg: BaseConfig) -> list[dict]:
                         # Шаг 2.3. Запускаем расчетный движок.
                         result = simulate_scenario(cfg, scenario)
                         shoe_fraction = scenario.tubing_shoe_from_heel_m / scenario.lateral_length_m
+                        profile_ru = {
+                            "flat": "плоско-горизонтальный",
+                            "ascending": "восходящий",
+                            "descending": "нисходящий",
+                            "stepped": "ступенчатый",
+                        }.get(scenario.profile, scenario.profile)
                         # Шаг 2.4. Сохраняем метрики сценария в строку выходной таблицы.
                         records.append(
                             {
                                 "scenario_id": scenario_id,
+                                "inflow_method": cfg.reservoir.inflow_method,
+                                "pwf_mode": cfg.reservoir.pwf_mode,
+                                "ppc_method": cfg.reservoir.ppc_method,
+                                "z_method": cfg.reservoir.z_method,
                                 "ae": scenario.anisotropy_ae,
                                 "profile": scenario.profile,
-                                "profile_ru": "плоско-горизонтальный" if scenario.profile == "flat" else "восходящий",
+                                "profile_ru": profile_ru,
                                 "curvature_radius_m": scenario.curvature_radius_m,
                                 "curvature_class": curvature_class(scenario.curvature_radius_m),
                                 "lateral_length_m": scenario.lateral_length_m,

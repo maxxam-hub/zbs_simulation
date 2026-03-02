@@ -13,6 +13,8 @@ if str(SRC) not in sys.path:
 from zbs_sim import default_config, run_sensitivity
 from zbs_sim.visualization import (
     save_anisotropy_plot,
+    save_profile_pressure_comparison_plot,
+    save_profile_rate_comparison_plot,
     save_pressure_profile_plot,
     save_rate_vs_length_plot,
 )
@@ -29,6 +31,8 @@ def main() -> None:
     cfg = default_config()
     output_dir = ROOT / cfg.output.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Метод коэффициентов притока A/B: {cfg.reservoir.inflow_method}")
+    print(f"Режим по забойному давлению: {cfg.reservoir.pwf_mode}")
     print(f"Метод псевдокритических параметров: {cfg.reservoir.ppc_method}")
     print(f"Метод расчета Z-фактора: {cfg.reservoir.z_method}")
     if cfg.reservoir.gas_composition_mol_frac:
@@ -52,6 +56,10 @@ def main() -> None:
         with csv_path_ru.open("w", newline="", encoding="utf-8") as file_ru:
             fields_ru = [
                 "ID_сценария",
+                "Метод_A_B",
+                "Режим_Pз",
+                "Метод_Pпкр",
+                "Метод_Z",
                 "Анизотропия_ae",
                 "Профиль",
                 "Класс_Rкр",
@@ -77,6 +85,10 @@ def main() -> None:
                 writer_ru.writerow(
                     {
                         "ID_сценария": row["scenario_id"],
+                        "Метод_A_B": row["inflow_method"],
+                        "Режим_Pз": row["pwf_mode"],
+                        "Метод_Pпкр": row["ppc_method"],
+                        "Метод_Z": row["z_method"],
                         "Анизотропия_ae": row["ae"],
                         "Профиль": row["profile_ru"],
                         "Класс_Rкр": row["curvature_class"],
@@ -102,17 +114,24 @@ def main() -> None:
     graph_1 = save_rate_vs_length_plot(records, cfg, output_dir / "plot_1_rate_vs_lateral_length.png")
     graph_2 = save_pressure_profile_plot(cfg, output_dir / "plot_2_pressure_profile_vs_shoe_depth.png")
     graph_3 = save_anisotropy_plot(records, cfg, output_dir / "plot_3_anisotropy_vs_lateral_length.png")
+    graph_4 = save_profile_rate_comparison_plot(records, cfg, output_dir / "plot_4_profile_rate_comparison.png")
+    graph_5 = save_profile_pressure_comparison_plot(cfg, output_dir / "plot_5_profile_pressure_comparison.png")
 
     # Шаг 5. Выводим краткую сводку по лучшим сценариям.
     top = sorted(records, key=lambda item: float(item["q_std_m3_day"]), reverse=True)[:10]
     print(f"Смоделировано сценариев: {len(records)}")
     print(f"Таблица результатов: {csv_path}")
     print(f"Таблица результатов (рус.): {csv_path_ru}")
-    if not (graph_1 and graph_2 and graph_3):
+    if not (graph_1 and graph_2 and graph_3 and graph_4 and graph_5):
         print("matplotlib недоступен: вместо PNG сохранены CSV-данные для построения графиков.")
     print("Топ-10 по прогнозному дебиту (ст.м3/сут):")
     for row in top:
-        profile_ru = "плоско-горизонтальный" if row["profile"] == "flat" else "восходящий"
+        profile_ru = {
+            "flat": "плоско-горизонтальный",
+            "ascending": "восходящий",
+            "descending": "нисходящий",
+            "stepped": "ступенчатый",
+        }.get(row["profile"], row["profile"])
         print(
             f"{int(row['scenario_id']):5d} | "
             f"Q={float(row['q_std_m3_day']):12.2f} | "
